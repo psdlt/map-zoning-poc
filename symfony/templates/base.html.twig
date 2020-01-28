@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Zoning POC</title>
+
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.6.0/dist/leaflet.css"
+              integrity="sha512-xwE/Az9zrjBIphAcBb3F6JVqxf46+CDLwfLMHloNu6KEQCAWi6HcDUbeOfBIptF7tcCzusKFjFw2yuvEpDL9wQ=="
+              crossorigin=""/>
+
+        <script src="https://unpkg.com/leaflet@1.6.0/dist/leaflet.js"
+                integrity="sha512-gZwIG9x3wUXg2hdXF6+rVkLF/0Vi9U8D2Ntg4Ga5I5BZpVkVxlJWbSQtXPSiUTtC0TjtGOmxa1AJPuV0CPthew=="
+                crossorigin=""></script>
+        <script src='https://npmcdn.com/@turf/turf/turf.min.js'></script>
+        <script src="https://code.jquery.com/jquery-3.3.1.min.js"></script>
+
+        <script src="/leaflet-draw/leaflet.draw.js"></script>
+        <link rel="stylesheet" href="/leaflet-draw/leaflet.draw.css"/>
+
+        <!-- custom style -->
+        <style>
+            #container {
+                display: flex;
+            }
+            #map {
+                height: 600px;
+                width: 900px;
+            }
+            #controls {
+                margin: 0 30px;
+            }
+            #zones-list > div > a {
+                cursor: pointer;
+            }
+
+            .contextMenu {
+                position: absolute;
+                border: 1px #CECECE solid;
+                padding: 2px;
+                background-color: #FFF;
+                z-index: 9001;
+                font-size: 13px;
+            }
+
+            .contextMenu .item {
+                border-bottom: 1px #DEDEDE solid;
+                padding: 3px 0;
+                cursor: pointer;
+            }
+
+            .contextMenu .item:hover {
+                background-color: #DEDEDE;
+            }
+
+            .contextMenu .textItem {
+                font-weight: bold;
+                margin-bottom: 10px;
+            }
+
+        </style>
+    </head>
+    <body>
+        <div id="container">
+            <div id="map"></div>
+            <div id="controls">
+                <fieldset>
+                    <legend>Add new zone</legend>
+                    <form onsubmit="search(); return false;">
+                        <input type="text" placeholder="search for areas" id="zone-search">
+                        <button type="submit">Search</button>
+                    </form>
+                    <div id="zones-list"></div>
+                </fieldset>
+                <fieldset>
+                    <legend>Actions</legend>
+                    <button onclick="getAllZones()" type="button">Load zones</button>
+                    <button onclick="resetState();" type="button">Reset state</button>
+                </fieldset>
+                <fieldset>
+                    <legend>Shipment</legend>
+
+                    <form onsubmit="searchShipment(); return false;" style="display:flex" id="shipment">
+                        <fieldset>
+                            <legend>From</legend>
+                            {{  form_widget(shipmentForm.from) }}
+                        </fieldset>
+                        <fieldset>
+                            <legend>To</legend>
+                            {{  form_widget(shipmentForm.to) }}
+                        </fieldset>
+
+                        <button type="submit">Search</button>
+                    </form>
+
+                    <div id="search-result"></div>
+                </fieldset>
+            </div>
+        </div>
+
+        <script>
+            const map = L.map('map');
+            const previewPolys = [];
+            const zonesLayer = new L.LayerGroup();
+            const markerLayer = new L.LayerGroup();
+            const editableLayer = new L.FeatureGroup();
+            let addButton = null;
+            let activeZone = null;
+            let drawControls = [];
+            let editableZone = null;
+
+            const endpoints = {
+                addZone: '/zone/add', // post
+                getZones: '/zone', // get
+                getDetailedZone: '/zone/detailed/{uuid}', // get
+                updatePolygons: '/zone/polygons/{uuid}', // post
+                deleteZone: '/zone/delete/{uuid}', // delete
+                setPricing: '/pricing', // post
+                getPricing: '/pricing/zone/{uuid}', // get
+                shipShipment: '/shipment/ship', // post
+            };
+
+            const editableShapeOptions = {
+                fillColor: '#44239e',
+                color: '#9b27ff',
+            };
+
+            const geoZone = L.GeoJSON.extend({
+               options: {
+                   uuid: 'Zone UUID',
+                   name: 'Zone name',
+               }
+            });
+
+            const removePolygon = L.Draw.Polygon.extend({
+                options: {
+                    shapeOptions: {
+                        removePolygon: true, // hackity hack
+                    },
+                },
+                initialize: function (map, options) {
+                    this.type = 'polygon';
+                    L.Draw.Feature.prototype.initialize.call(this, map, options);
+                }
+            });
+
+            const drawRemovePolygon = L.Control.extend({
+                options: {
+                    position: 'topleft',
+                },
+                onAdd: (map) => {
+                    const button = document.createElement("button");
+                    button.innerText = "[R]";
+                    button.type = "button";
+                    button.onclick = () => {
+                      const poly = new removePolygon(map);
+                      poly.enable();
+                    };
+                    return button;
+                },
+                onRemove: (map) => {
+                  //
+                },
+            });
+
+            const saveChanges = L.Control.extend({
+                options: {
+                    position: 'topleft',
+                },
+                onAdd: (map) => {
+                    const button = document.createElement("button");
+                    button.innerText = "Save";
+                    button.type = "button";
+                    button.onclick = saveEdits;
+                    return button;
+                },
+                onRemove: (map) => {
+                    //
+                },
+            });
+
+            map.on('load', () => {
+                // load zones when map is ready
+                getAllZones();
+            });
+
+            map.on('draw:created', (e) => {
+                console.log('draw:created', e);
+                if (typeof e.layer.options.removePolygon !== "undefined") {
+                    // remove
+                    const layer2 = turf.polygon(e.layer.toGeoJSON().geometry.coordinates);
+                    const newLayers = [];
+                    editableLayer.eachLayer((layer) => {
+                        const layer1 = turf.polygon(layer.toGeoJSON().geometry.coordinates);
+                        const diff = turf.difference(layer1, layer2);
+                        if (diff) {
+                            if (diff.geometry.type === "Polygon") {
+                                // simple single polygon
+                                newLayers.push(L.polygon(flipCoords(diff.geometry.coordinates), editableShapeOptions));
+                            }
+                            if (diff.geometry.type === "MultiPolygon") {
+                                diff.geometry.coordinates.forEach((coords) => {
+                                   newLayers.push(L.polygon(flipCoords(coords), editableShapeOptions));
+                                });
+                            }
+                        }
+                    });
+                    editableLayer.clearLayers();
+                    newLayers.forEach((layer) => {
+                        layer.addTo(editableLayer);
+                    });
+
+                    return;
+                }
+
+                // simply add new polygon
+                editableLayer.addLayer(e.layer);
+            });
+
+            function flipCoords(coords) {
+                return coords.map(row => row.map((pair) => {
+                    return [pair[1], pair[0]];
+                }));
+            }
+
+            $(document).ready(() => {
+                // setup map
+                map.setView([49.553912, 11.650399], 4);
+                L.tileLayer('https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}', {
+                    attribution: 'OSM',
+                    maxZoom: 18,
+                    id: 'mapbox/streets-v11',
+                    accessToken: '{{ mapboxToken }}'
+                }).addTo(map);
+                zonesLayer.addTo(map);
+                markerLayer.addTo(map);
+                editableLayer.addTo(map);
+
+                map.on('contextmenu', (event) => {
+                   const zones = zonesAtPoint(event.latlng);
+                   if (zones.length > 0) {
+                       buildContextMenu(zones, event.originalEvent);
+                   }
+                });
+
+                // destroy context menu
+                $(document).mousedown(function(e) {
+                    const container = $(".contextMenu");
+                    if (!container.is(e.target) && container.has(e.target).length === 0) {
+                        closeContextMenu();
+                    }
+                });
+            });
+
+            function findZoneInLayer(uuid) {
+                let zone = null;
+                zonesLayer.eachLayer((layer) => {
+                    if (layer.options.uuid === uuid) {
+                        zone = layer;
+                    }
+                });
+                return zone;
+            }
+
+            function zonesAtPoint(latlng) {
+                const point = turf.point([latlng.lng, latlng.lat]);
+                const zones = [];
+                zonesLayer.eachLayer((layer) => {
+                    //console.log(layer);
+                    const feature = turf.feature(layer.toGeoJSON().features[0].geometry);
+                    if (turf.booleanPointInPolygon(point, feature)) {
+                        zones.push(layer);
+                    }
+                });
+
+                return zones;
+            }
+
+            function buildContextMenu(zones, event) {
+                if (!map.hasLayer(zonesLayer)) {
+                    // are zones even visible? (special case when in "edit mode")
+                    return false;
+                }
+
+                const $menu = $("<div class='contextMenu'></div>");
+                $menu.css({
+                    top: event.y + 15 + "px",
+                    left: event.x + 15 + "px",
+                });
+
+                // select
+                $menu.append($("<div class='textItem'>Select zone:</div>"));
+
+                zones.forEach((zone) => {
+                    const $item = $("<div class='item'></div>");
+                    $item.text(zone.options.name);
+                    $item.click(() => {
+                        closeContextMenu();
+                        setZoneActive(zone.options.uuid);
+                    });
+
+                    $menu.append($item);
+                });
+
+                // set pricing
+                if (activeZone) {
+                    $menu.append($("<div class='textItem'>Set pricing to</div>"));
+
+                    zones.forEach((zone) => {
+                        if (activeZone.options.uuid === zone.options.uuid) {
+                            // don't let set pricing TO the originator zone
+                            return;
+                        }
+
+                        const $item = $("<div class='item'></div>");
+                        $item.text(zone.options.name);
+                        $item.click(() => {
+                            closeContextMenu();
+                            setPricingFromTo(activeZone.options.uuid, zone.options.uuid);
+                        });
+
+                        $menu.append($item);
+                    });
+                }
+
+                // other actions
+                $menu.append($("<div class='textItem'>Edit:</div>"));
+
+                zones.forEach((zone) => {
+                    const $item = $(`<div class='item'>Edit ${zone.options.name}</div>`);
+                    $item.click(() => {
+                        closeContextMenu();
+                        editZone(zone);
+                    });
+
+                    $menu.append($item);
+                });
+
+                // delete zone
+                $menu.append($("<div class='textItem'>Delete:</div>"));
+
+                zones.forEach((zone) => {
+                    const $item = $(`<div class='item'>Delete ${zone.options.name}</div>`);
+                    $item.click(() => {
+                        closeContextMenu();
+                        if (confirm('Are you sure?')) {
+                            deleteZone(zone);
+                        }
+                    });
+
+                    $menu.append($item);
+                });
+
+
+                // show
+                $("body").append($menu);
+            }
+
+            function closeContextMenu() {
+                $(".contextMenu").remove();
+            }
+
+            function clearActiveZone() {
+                zonesLayer.eachLayer((layer) => {
+                    layer.resetStyle();
+                });
+
+                activeZone = null;
+                resetTooltips();
+            }
+
+            function setPricingFromTo(fromZone, toZone) {
+                const price = prompt('Enter new price');
+                if (!price) {
+                    return;
+                }
+
+                $.ajax(endpoints.setPricing, {
+                    type: 'POST',
+                    dataType: 'json',
+                    data: JSON.stringify({
+                        fromZone,
+                        toZone,
+                        price
+                    }),
+                    success: () => {
+                        getPricingsFrom(findZoneInLayer(fromZone));
+                    },
+                });
+            }
+
+            function getPricingsFrom(fromZone) {
+                const url = endpoints.getPricing.replace("{uuid}", fromZone.options.uuid);
+                $.get(url, (result) => {
+                    result.forEach((item) => {
+                        const zone = findZoneInLayer(item.toZone);
+                        if (!zone) {
+                            // odd...
+                            return;
+                        }
+
+                        // remove old tooltip and create a new one
+                        zone.unbindTooltip();
+                        zone.bindTooltip(`${zone.options.name} - ${item.price} EUR`, {
+                            permanent: true,
+                        });
+                    });
+                }, "json");
+            }
+
+            function resetTooltips() {
+                zonesLayer.eachLayer((zone) => {
+                    zone.unbindTooltip();
+                    zone.bindTooltip(zone.options.name, {
+                        permanent: true,
+                    });
+                });
+            }
+
+            function setZoneActive(uuid) {
+                // reset style for other zones
+                clearActiveZone();
+                clearPreview();
+
+                // find zone
+                const zone = findZoneInLayer(uuid);
+                if (!zone) {
+                    return;
+                }
+                zone.setStyle(() => {
+                    return {
+                        fillColor: '#409e44',
+                        color: '#0F0',
+                    };
+                });
+
+                console.log(zone);
+
+                activeZone = zone;
+
+                // get pricing
+                getPricingsFrom(zone);
+            }
+
+            function search() {
+                clearPreview();
+
+                const val = $("#zone-search").val();
+
+                const url = `https://nominatim.openstreetmap.org/search?q=${val}&format=json&polygon_geojson=1&polygon_threshold=0.00075`;
+                const $zonesList = $("#zones-list");
+                $zonesList.empty();
+                $zonesList.append($("<div>Searching...</div>"));
+
+                $.get(url, (result) => {
+                    $zonesList.empty();
+                    if (result.length === 0) {
+                        $zonesList.append($("<div>No results</div>"));
+                        return;
+                    }
+
+                    result.forEach((item) => {
+                        if (typeof item.geojson === "undefined" || item.geojson.type === "Point") {
+                            // not bounds? don't bother
+                            // not interested in Points either
+                            return;
+                        }
+                        const $dom = $(`<div></div>`);
+                        const $a = $(`<a>${item.display_name}</a>`);
+                        $a.click(() => previewPoly(item));
+                        $dom.append($a);
+                        $zonesList.append($dom);
+                    });
+                }, "json");
+            }
+
+            function clearPreview() {
+                previewPolys.forEach((old) => {
+                    old.remove();
+                });
+
+                if (addButton !== null) {
+                    addButton.remove();
+                }
+            }
+
+            function resetState() {
+                clearPreview();
+                clearActiveZone();
+                markerLayer.clearLayers();
+
+                // cancel edit
+                editableLayer.clearLayers();
+                drawControls.forEach((control) => {
+                    map.removeControl(control);
+                });
+                drawControls = [];
+                editableZone = null;
+
+                // reset zones layer
+                if (!map.hasLayer(zonesLayer)) {
+                    zonesLayer.addTo(map);
+                }
+            }
+
+            function previewPoly(item) {
+                console.log(item);
+
+                // clear old previewPolys
+                clearPreview();
+
+                // draw poly
+                const poly = L.geoJSON(item.geojson, {
+                    style: (feature) => {
+                        return {
+                            color: '#f55cff',
+                        };
+                    }
+                }).addTo(map);
+
+                // marker
+                // only add it if we're displaying polygon
+                if (item.geojson.type === "Polygon" || item.geojson.type === "MultiPolygon") {
+                    const button = document.createElement("button");
+                    button.innerText = "Add";
+                    button.onclick = () => addPoly(item);
+
+                    const icon = L.divIcon({
+                        html: button,
+                        className: 'no-style',
+                    });
+                    addButton = L.marker(L.latLng(item.lat, item.lon), {
+                        icon,
+                    });
+                    addButton.addTo(map);
+                }
+
+                // fit to bounds
+                map.fitBounds(poly.getBounds());
+                previewPolys.push(poly);
+            }
+
+            function addPoly(item) {
+                console.log(item);
+
+                const name = prompt('Please provide zone name');
+                if (!name) {
+                    // name is mandatory
+                    return;
+                }
+
+                // override display name
+                item.display_name = name;
+
+                $.ajax(endpoints.addZone, {
+                    type: 'POST',
+                    dataType: 'json',
+                    data: JSON.stringify(item),
+                    success: () => { clearPreview(); getAllZones(); }
+                });
+            }
+
+            function getAllZones() {
+                $.get(endpoints.getZones, (json) => {
+                    // clear existing zones
+                    zonesLayer.clearLayers();
+                    // create new zones
+                    json.forEach((item) => {
+                        const zone = new geoZone(item.geoJson, {
+                            style: (feature) => {
+                                return {
+                                    color: 'red',
+                                };
+                            },
+                            uuid: item.uuid,
+                            name: item.name,
+                        }).addTo(zonesLayer);
+                    });
+                    resetTooltips();
+                }, "json");
+            }
+
+            function searchShipment() {
+                const $result = $("#search-result");
+                $result.text("Searching...");
+
+                $.post(endpoints.shipShipment, $("#shipment").serialize(), (result) => {
+                    // reset state
+                    resetState();
+
+                    console.log(result);
+
+                    L.marker([result.from.lat, result.from.lng]).addTo(markerLayer);
+                    L.marker([result.to.lat, result.to.lng]).addTo(markerLayer);
+
+                    // do we have "from" zone?
+                    if (result.fromZone) {
+                        const zone = findZoneInLayer(result.fromZone);
+                        if (zone) {
+                            zone.setStyle(() => {
+                                return {
+                                    fillColor: '#e0d958',
+                                    color: '#fffb00',
+                                };
+                            });
+                        }
+                    }
+
+                    // do we have "to" zone?
+                    if (result.toZone) {
+                        const zone = findZoneInLayer(result.toZone);
+                        if (zone) {
+                            zone.setStyle(() => {
+                                return {
+                                    fillColor: '#e0d958',
+                                    color: '#fffb00',
+                                };
+                            });
+                        }
+                    }
+
+                    // format result string
+                    let resultString = 'Either can not find "from" zone, or "to" zone, or pricing between zones';
+                    if (result.fromZone && result.toZone && result.price) {
+                        const fromZone = findZoneInLayer(result.fromZone);
+                        const toZone = findZoneInLayer(result.toZone);
+
+                        resultString = `${fromZone.options.name} to ${toZone.options.name} for ${result.price} EUR`;
+                    }
+                    $result.text(resultString);
+                }, "json");
+            }
+
+            function enableDraw() {
+                if (drawControls.length !== 0) {
+                    return;
+                }
+
+                drawControls.push(new L.Control.Draw({
+                    edit: {
+                        featureGroup: editableLayer,
+                        edit: false,
+                    },
+                    draw: {
+                        polyline: false,
+                        rectangle: false,
+                        circle: false,
+                        marker: false,
+                        circlemarker: false,
+                    },
+                }));
+
+                // custom controls
+                drawControls.push(new drawRemovePolygon());
+                drawControls.push(new saveChanges());
+
+                // add to the UI
+                drawControls.forEach((controls) => {
+                    map.addControl(controls);
+                });
+            }
+
+            function editZone(zone) {
+                resetState();
+                // enable draw toolbar
+                enableDraw();
+                // add zone we wish to edit to the edit layer
+                const url = endpoints.getDetailedZone.replace('{uuid}', zone.options.uuid);
+                $.get(url, (result) => {
+                    result.polygons.forEach((item) => {
+                        console.log(item.line);
+                        const polygon = L.polygon(item.coordinates, editableShapeOptions);
+                        polygon.addTo(editableLayer);
+                    });
+                    editableZone = zone;
+
+                    // hide other zones
+                    zonesLayer.removeFrom(map);
+                }, "json");
+            }
+
+            function saveEdits() {
+                const url = endpoints.updatePolygons.replace('{uuid}', editableZone.options.uuid);
+                const data = [];
+                editableLayer.eachLayer((layer) => {
+                    data.push(layer.getLatLngs());
+                });
+
+                $.ajax(url, {
+                    type: 'POST',
+                    dataType: 'json',
+                    data: JSON.stringify(data),
+                    success: () => { resetState(); getAllZones(); }
+                });
+            }
+
+            function deleteZone(zone) {
+                const url = endpoints.deleteZone.replace('{uuid}', zone.options.uuid);
+                $.ajax(url, {
+                    type: 'DELETE',
+                    success: () => {
+                        resetState();
+                        getAllZones();
+                    },
+                });
+            }
+        </script>
+    </body>
+</html>

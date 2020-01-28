@@ -1,0 +1,25 @@
+version: '3.0'
+
+services:
+  ss2-api:
+    container_name: zoning-poc
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zoning-poc
+    ports:
+      - '8001:80'
+    volumes:
+      - ../symfony/:/var/www/html
+    depends_on:
+      - zoning-poc-db
+    links:
+      - zoning-poc-db
+
+  zoning-poc-db:
+    image: postgres:11
+    container_name: zoning-poc-db
+    environment:
+      POSTGRES_PASSWORD: stupid
+    ports:
+    - '5432:5432'
